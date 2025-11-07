@@ -3,7 +3,7 @@
   "description": "Fault-tolerant mutex with circuit breaker pattern and automatic backend switching for Yii2",
   "type": "yii2-extension",
   "keywords": ["yii2", "mutex", "resilience", "circuit-breaker", "fault-tolerance", "high-availability"],
-  "license": "MIT",
+  "license": "GPL-3.0-or-later",
   "authors": [
     {
       "name": "pozitronik",
