@@ -1,0 +1,60 @@
+name: Tests
+
+on:
+  push:
+    branches: [ master, dev ]
+  pull_request:
+    branches: [ master, dev ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Default dependencies (latest stable)
+          - php: '8.4'
+          # Lowest supported dependencies
+          - php: '8.4'
+            dependencies: 'lowest'
+
+    name: PHP ${{ matrix.php }}${{ matrix.dependencies == 'lowest' && ' (lowest)' || '' }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: mbstring
+          coverage: xdebug
+
+      - name: Validate composer.json
+        run: composer validate --strict
+
+      - name: Install dependencies (default)
+        if: matrix.dependencies != 'lowest'
+        run: composer update --prefer-dist --no-interaction --no-progress
+
+      - name: Install dependencies (lowest)
+        if: matrix.dependencies == 'lowest'
+        run: composer update --prefer-lowest --prefer-stable --prefer-dist --no-interaction --no-progress
+
+      - name: Run tests (without coverage)
+        if: matrix.dependencies == 'lowest'
+        run: vendor/bin/phpunit --colors=always --no-coverage
+
+      - name: Run tests with coverage
+        if: matrix.dependencies != 'lowest'
+        run: vendor/bin/phpunit --coverage-clover coverage.xml
+
+      - name: Upload coverage to Codecov
+        if: matrix.php == '8.4' && matrix.dependencies != 'lowest'
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
+          fail_ci_if_error: false
