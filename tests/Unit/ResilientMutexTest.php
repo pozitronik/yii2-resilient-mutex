@@ -1,4 +1,5 @@
 <?php
+/** @noinspection PhpRedundantOptionalArgumentInspection */
 declare(strict_types=1);
 
 namespace Beeline\ResilientMutex\Tests\Unit;
@@ -7,7 +8,9 @@ use Beeline\CircuitBreaker\BreakerInterface;
 use Beeline\ResilientMutex\ResilientMutex;
 use Exception;
 use PHPUnit\Framework\TestCase;
+use ReflectionClass;
 use RuntimeException;
+use stdClass;
 use yii\base\InvalidConfigException;
 use yii\mutex\Mutex;
 
@@ -401,6 +404,243 @@ class ResilientMutexTest extends TestCase
         self::assertTrue($b1->isLocked('lock1'));
         self::assertTrue($b1->isLocked('lock2'));
     }
+
+    /**
+     * Проверка выброса исключения при отсутствии ключа 'mutex' в конфигурации бэкенда
+     */
+    public function testInitThrowsExceptionWhenMutexKeyMissing(): void
+    {
+        $this->expectException(InvalidConfigException::class);
+        $this->expectExceptionMessage("Backend 0 must have 'mutex' configuration");
+
+        new ResilientMutex([
+            'backends' => [
+                ['retries' => 1], // 'mutex' отсутствует
+            ],
+        ]);
+    }
+
+    /**
+     * Проверка инициализации с конфигурацией mutex в виде массива
+     */
+    public function testInitWithMutexAsArrayConfig(): void
+    {
+        $mutex = new ResilientMutex([
+            'backends' => [
+                [
+                    'mutex' => ['class' => MockMutex::class],
+                    'retries' => 1,
+                ],
+            ],
+        ]);
+
+        $status = $mutex->getBackendStatus();
+
+        self::assertCount(1, $status);
+        self::assertEquals(MockMutex::class, $status[0]['class']);
+    }
+
+    /**
+     * Проверка выброса исключения когда mutex не является экземпляром Mutex
+     */
+    public function testInitThrowsExceptionWhenMutexNotInstance(): void
+    {
+        $this->expectException(InvalidConfigException::class);
+        $this->expectExceptionMessage("Backend 0 mutex must extend yii\\mutex\\Mutex");
+
+        new ResilientMutex([
+            'backends' => [
+                ['mutex' => new stdClass()], // Не экземпляр Mutex
+            ],
+        ]);
+    }
+
+    /**
+     * Проверка освобождения блокировки с неизвестным бэкендом (вызывает releaseOnAllBackends)
+     *
+     * Сценарий: если индекс бэкенда для блокировки неизвестен (был удалён из внутреннего
+     * массива или не был записан), метод release должен попробовать освободить блокировку
+     * на всех бэкендах и вернуть true, если хотя бы один бэкенд успешно освободил.
+     */
+    public function testReleaseWithUnknownBackend(): void
+    {
+        $b1 = new MockMutex();
+        $b2 = new MockMutex();
+
+        $mutex = new ResilientMutex([
+            'backends' => [
+                ['mutex' => $b1, 'retries' => 1],
+                ['mutex' => $b2, 'retries' => 1],
+            ],
+        ]);
+
+        // Захватываем блокировку на первом бэкенде
+        $mutex->acquire('test_lock', 5);
+        self::assertTrue($b1->isLocked('test_lock'));
+
+        // Используем рефлексию для удаления записи о бэкенде (имитация потери информации)
+        $reflection = new ReflectionClass($mutex);
+        $property = $reflection->getProperty('acquiredLocks');
+        $property->setValue($mutex, []); // Очищаем информацию о захваченных блокировках
+
+        // Попытка освободить должна пройти по всем бэкендам и найти блокировку
+        $result = $mutex->release('test_lock');
+
+        self::assertTrue($result, 'Должна успешно освободить блокировку на резервном пути');
+        self::assertFalse($b1->isLocked('test_lock'), 'Блокировка должна быть освобождена');
+    }
+
+    /**
+     * Проверка освобождения с fallback на несколько бэкендов
+     *
+     * Сценарий: проверяем, что releaseOnAllBackends освобождает блокировки на всех
+     * бэкендах, где они были захвачены, даже если некоторые бэкенды выбрасывают исключения.
+     */
+    public function testReleaseOnAllBackendsWithPartialFailure(): void
+    {
+        $b1 = new FailingMutex();
+        $b2 = new MockMutex();
+        $b3 = new MockMutex();
+
+        $mutex = new ResilientMutex([
+            'backends' => [
+                ['mutex' => $b1, 'retries' => 1],
+                ['mutex' => $b2, 'retries' => 1],
+                ['mutex' => $b3, 'retries' => 1],
+            ],
+        ]);
+
+        // Захватываем блокировки вручную на втором и третьем бэкенде
+        $b2->acquire('test_lock', 0);
+        $b3->acquire('test_lock', 0);
+
+        // Используем рефлексию для сброса информации о бэкендах
+        $reflection = new ReflectionClass($mutex);
+        $property = $reflection->getProperty('acquiredLocks');
+        $property->setValue($mutex, []);
+
+        // Попытка освободить: первый бэкенд выбросит исключение, остальные освободят
+        $result = $mutex->release('test_lock');
+
+        self::assertTrue($result, 'Должна вернуть true если хотя бы один бэкенд освободил');
+        self::assertFalse($b2->isLocked('test_lock'));
+        self::assertFalse($b3->isLocked('test_lock'));
+    }
+
+    /**
+     * Проверка обработки исключений при освобождении блокировки
+     *
+     * Сценарий: если при освобождении блокировки бэкенд выбрасывает исключение,
+     * метод должен записать ошибку в breaker, удалить блокировку из отслеживания
+     * и вернуть false.
+     */
+    public function testReleaseFailsWithException(): void
+    {
+        $b1 = new FailingMutex();
+
+        $mutex = new ResilientMutex([
+            'backends' => [
+                ['mutex' => $b1, 'retries' => 1],
+            ],
+        ]);
+
+        // Используем рефлексию для имитации захваченной блокировки
+        $reflection = new ReflectionClass($mutex);
+        $property = $reflection->getProperty('acquiredLocks');
+        $property->setValue($mutex, ['test_lock' => 0]);
+
+        // Попытка освободить - должна обработать исключение
+        $result = $mutex->release('test_lock');
+
+        self::assertFalse($result, 'Должна вернуть false при ошибке освобождения');
+        self::assertEmpty($mutex->getAcquiredLocks(), 'Блокировка должна быть удалена из отслеживания');
+    }
+
+    /**
+     * Проверка пропуска открытых circuit breakers в глобальной стратегии повторов
+     *
+     * Сценарий: при использовании стратегии RETRY_GLOBAL, если circuit breaker одного
+     * из бэкендов открыт, система должна пропустить его и попробовать следующий бэкенд
+     * без увеличения счётчика глобальных попыток.
+     */
+    public function testGlobalRetrySkipsOpenCircuit(): void
+    {
+        $b1 = new MockMutex();
+        $b2 = new MockMutex();
+
+        $mutex = new ResilientMutex([
+            'backends' => [
+                ['mutex' => $b1, 'retryDelay' => 1],
+                ['mutex' => $b2, 'retryDelay' => 1],
+            ],
+            'retryStrategy' => ResilientMutex::RETRY_GLOBAL,
+            'globalRetries' => 5,
+        ]);
+
+        // Принудительно открываем первый circuit breaker
+        $mutex->forceBackendOpen(0);
+
+        // Попытка захвата должна пропустить первый бэкенд и использовать второй
+        $result = $mutex->acquire('test_lock', 5);
+
+        self::assertTrue($result, 'Должна успешно захватить на втором бэкенде');
+        self::assertFalse($b1->isLocked('test_lock'), 'Первый бэкенд не должен использоваться');
+        self::assertTrue($b2->isLocked('test_lock'), 'Второй бэкенд должен захватить блокировку');
+    }
+
+    /**
+     * Проверка превышения лимита глобальных повторов
+     *
+     * Сценарий: при использовании стратегии RETRY_GLOBAL с ограниченным количеством
+     * попыток, если все попытки исчерпаны, система должна прекратить повторы и вернуть false.
+     */
+    public function testGlobalRetryExceedsLimit(): void
+    {
+        $b1 = new CountingMutex(100); // Будет отказывать 100 раз
+        $b2 = new CountingMutex(100);
+
+        $mutex = new ResilientMutex([
+            'backends' => [
+                ['mutex' => $b1, 'retryDelay' => 1],
+                ['mutex' => $b2, 'retryDelay' => 1],
+            ],
+            'retryStrategy' => ResilientMutex::RETRY_GLOBAL,
+            'globalRetries' => 3, // Всего 3 попытки
+        ]);
+
+        $result = $mutex->acquire('test_lock', 0);
+
+        self::assertFalse($result, 'Должна вернуть false после исчерпания попыток');
+        // Проверяем что было сделано ровно 3 попытки (может быть меньше из-за распределения)
+        self::assertLessThanOrEqual(3, $b1->attempts + $b2->attempts);
+    }
+
+    /**
+     * Проверка неуспешного захвата после всех глобальных попыток
+     *
+     * Сценарий: если все бэкенды закрыты (circuit breakers в порядке), но блокировка
+     * не может быть захвачена (заблокирована другим процессом) после всех попыток,
+     * система должна вернуть false и залогировать ошибку.
+     */
+    public function testGlobalRetryFailsAfterAllAttempts(): void
+    {
+        // Создаём мьютексы, которые возвращают false (блокировка уже захвачена)
+        $b1 = new AlreadyLockedMutex();
+        $b2 = new AlreadyLockedMutex();
+
+        $mutex = new ResilientMutex([
+            'backends' => [
+                ['mutex' => $b1, 'retryDelay' => 1],
+                ['mutex' => $b2, 'retryDelay' => 1],
+            ],
+            'retryStrategy' => ResilientMutex::RETRY_GLOBAL,
+            'globalRetries' => 4,
+        ]);
+
+        $result = $mutex->acquire('test_lock', 0);
+
+        self::assertFalse($result, 'Должна вернуть false после всех неудачных попыток');
+    }
 }
 
 /**
@@ -540,5 +780,35 @@ class CountingMutex extends Mutex
     public function isLocked(string $name): bool
     {
         return isset($this->locks[$name]);
+    }
+}
+
+/**
+ * Тестовая заглушка mutex, имитирующая уже захваченную блокировку (возвращает false)
+ *
+ * Используется для тестирования сценариев, когда блокировка уже захвачена другим
+ * процессом и не может быть получена, но не выбрасывает исключений.
+ */
+class AlreadyLockedMutex extends Mutex
+{
+    /**
+     * @param $name
+     * @param $timeout
+     *
+     * @return bool Всегда возвращает false (блокировка уже захвачена)
+     */
+    protected function acquireLock($name, $timeout = 0): bool
+    {
+        return false; // Блокировка уже захвачена другим процессом
+    }
+
+    /**
+     * @param $name
+     *
+     * @return bool Всегда возвращает false (блокировка не была захвачена)
+     */
+    protected function releaseLock($name): bool
+    {
+        return false; // Нечего освобождать
     }
 }
