@@ -13,7 +13,7 @@
   "require": {
     "php": "^8.4",
     "yiisoft/yii2": "^2.0.45",
-    "beeline/yii2-circuit-breaker": "^1.0"
+    "beeline/yii2-circuit-breaker": "^1.0.3"
   },
   "require-dev": {
     "phpunit/phpunit": "^12.0"
