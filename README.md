@@ -481,4 +481,4 @@ foreach ($status as $backend) {
 
 ## Лицензия
 
-GNU GPLv3.
+GNU Lesser General Public License 3.0
