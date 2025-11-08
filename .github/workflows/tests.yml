@@ -49,13 +49,26 @@ jobs:
       - name: Validate composer.json
         run: composer validate --strict
 
+      - name: Configure composer
+        run: |
+          composer config --global process-timeout 600
+          composer config --global github-protocols https
+
       - name: Install dependencies (default)
         if: matrix.dependencies != 'lowest'
-        run: composer update --prefer-dist --no-interaction --no-progress
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          command: composer update --prefer-dist --no-interaction --no-progress
 
       - name: Install dependencies (lowest)
         if: matrix.dependencies == 'lowest'
-        run: composer update --prefer-lowest --prefer-stable --prefer-dist --no-interaction --no-progress
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 5
+          max_attempts: 3
+          command: composer update --prefer-lowest --prefer-stable --prefer-dist --no-interaction --no-progress
 
       - name: Run tests (without coverage)
         if: matrix.dependencies == 'lowest'
